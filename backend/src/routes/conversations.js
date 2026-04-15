@@ -1,247 +1,66 @@
-/**
- * schedulerService.js — In-memory scheduler (sem Bull/Redis)
- * Compatível com SQLite para desenvolvimento local.
- * Em produção, substituir por Bull + Redis (ver schedulerService.prod.js).
- */
-const config = require('../config')
-const logger = require('../utils/logger')
-const whatsappService = require('./whatsappService')
+const express = require('express')
+const { authenticate } = require('../middleware/auth')
 const { decrypt } = require('../utils/crypto')
-
 const prisma = require('../utils/prismaClient')
+const logger = require('../utils/logger')
 
-// ─── MAPA DE TIMERS (job em memória) ─────────────────────────────────────────
-// agendamentoId → NodeJS.Timeout
-const timers = new Map()
+const router = express.Router()
+router.use(authenticate)
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function buildTemplateComponents(variaveis) {
-  if (!variaveis) return []
-  const components = []
-  if (variaveis.header) {
-    components.push({ type: 'header', parameters: [{ type: 'text', text: variaveis.header }] })
-  }
-  if (variaveis.body && Array.isArray(variaveis.body)) {
-    components.push({
-      type: 'body',
-      parameters: variaveis.body.map(v => ({ type: 'text', text: String(v) })),
-    })
-  }
-  return components
-}
-
-// ─── EXECUTOR DO JOB ─────────────────────────────────────────────────────────
-async function executeJob(agendamentoId) {
-  timers.delete(agendamentoId)
-
-  let agendamento
+router.get('/', async (req, res) => {
   try {
-    agendamento = await prisma.agendamento.findUnique({
-      where: { id: agendamentoId },
-      include: { tenant: true, eleitor: true },
-    })
-  } catch (err) {
-    logger.error(`Erro ao buscar agendamento ${agendamentoId}:`, err.message)
-    return
-  }
+    const { escalonado, ativa, page = 1, limit = 20 } = req.query
+    const where = { tenantId: req.tenantId }
+    if (escalonado !== undefined) where.escalonadoParaHumano = escalonado === 'true'
+    if (ativa !== undefined) where.ativa = ativa === 'true'
+    const [sessoes, total] = await Promise.all([
+      prisma.sessao.findMany({ where, include: { eleitor: true }, orderBy: { createdAt: 'desc' }, skip: (Number(page)-1)*Number(limit), take: Number(limit) }),
+      prisma.sessao.count({ where })
+    ])
+    res.json({ sessoes, total, page: Number(page), pages: Math.ceil(total/Number(limit)) })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
 
-  if (!agendamento || agendamento.status !== 'PENDENTE') {
-    logger.info(`Agendamento ${agendamentoId} ignorado (status: ${agendamento?.status ?? 'não encontrado'})`)
-    return
-  }
-
-  // Verificar opt-in do eleitor
-  if (agendamento.eleitor && agendamento.eleitor.optInStatus !== 'ACEITO') {
-    await prisma.agendamento.update({
-      where: { id: agendamentoId },
-      data: { status: 'CANCELADO', erroMensagem: 'Eleitor sem opt-in ativo' },
-    })
-    logger.warn(`Agendamento ${agendamentoId} cancelado: eleitor sem opt-in`)
-    return
-  }
-
-  // Verificar anti-ban
-  const safeCheck = whatsappService.isSafeToSend(agendamento.tenant)
-  if (!safeCheck.safe) {
-    logger.warn(`Envio bloqueado para ${agendamentoId}: ${safeCheck.reason}`)
-    // Re-agenda para 1h depois
-    const novaData = new Date(Date.now() + 3_600_000)
-    await prisma.agendamento.update({
-      where: { id: agendamentoId },
-      data: { agendadoPara: novaData, erroMensagem: `Adiado: ${safeCheck.reason}` },
-    })
-    scheduleTimer(agendamentoId, novaData)
-    return
-  }
-
-  let tentativas = agendamento.tentativas
-  const MAX_TENTATIVAS = 3
-
+router.get('/:id', async (req, res) => {
   try {
-    const numero = decrypt(agendamento.eleitor.whatsappNumberEnc)
-    const variaveis = agendamento.variaveis ? JSON.parse(agendamento.variaveis) : {}
-    const components = buildTemplateComponents(variaveis)
+    const sessao = await prisma.sessao.findFirst({ where: { id: req.params.id, tenantId: req.tenantId }, include: { eleitor: true } })
+    if (!sessao) return res.status(404).json({ error: 'Sessão não encontrada' })
+    let mensagens = []
+    try { mensagens = JSON.parse(decrypt(sessao.mensagensEnc) || '[]') } catch {}
+    res.json({ ...sessao, mensagens })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
 
-    await whatsappService.sendTemplate(
-      agendamento.tenant,
-      numero,
-      agendamento.templateNome,
-      'pt_BR',
-      components
-    )
-
-    await prisma.agendamento.update({
-      where: { id: agendamentoId },
-      data: { status: 'ENVIADO', enviadoAt: new Date() },
-    })
-
-    await prisma.tenant.update({
-      where: { id: agendamento.tenantId },
-      data: { mensagensHoje: { increment: 1 } },
-    })
-
-    logger.info(`Agendamento ${agendamentoId} enviado com sucesso`)
-  } catch (err) {
-    tentativas += 1
-    logger.error(`Erro ao executar agendamento ${agendamentoId} (tentativa ${tentativas}):`, err.message)
-
-    if (tentativas < MAX_TENTATIVAS) {
-      const retryDelay = Math.pow(2, tentativas) * 60_000 // 2min, 4min
-      const retryAt = new Date(Date.now() + retryDelay)
-      await prisma.agendamento.update({
-        where: { id: agendamentoId },
-        data: { tentativas, erroMensagem: err.message, agendadoPara: retryAt },
-      })
-      scheduleTimer(agendamentoId, retryAt)
-      logger.info(`Agendamento ${agendamentoId} reagendado para retry em ${retryDelay / 1000}s`)
-    } else {
-      await prisma.agendamento.update({
-        where: { id: agendamentoId },
-        data: { status: 'ERRO', tentativas, erroMensagem: err.message },
-      })
-    }
-  }
-}
-
-// ─── TIMER HELPER ─────────────────────────────────────────────────────────────
-function scheduleTimer(agendamentoId, dataAgendada) {
-  const delay = Math.max(new Date(dataAgendada).getTime() - Date.now(), 0)
-
-  // Limpar timer existente se houver
-  if (timers.has(agendamentoId)) {
-    clearTimeout(timers.get(agendamentoId))
-  }
-
-  const timer = setTimeout(() => executeJob(agendamentoId), delay)
-  // Impede que o timer bloqueie o processo de fechar
-  if (timer.unref) timer.unref()
-  timers.set(agendamentoId, timer)
-}
-
-// ─── API PÚBLICA ──────────────────────────────────────────────────────────────
-
-/**
- * Agenda envio de template HSM para um eleitor.
- */
-async function scheduleMessage({ tenantId, eleitorId, tipo, templateNome, variaveis, agendadoPara }) {
-  const agendamento = await prisma.agendamento.create({
-    data: {
-      tenantId,
-      eleitorId,
-      tipo,
-      templateNome,
-      variaveis: variaveis ? JSON.stringify(variaveis) : null,
-      agendadoPara: new Date(agendadoPara),
-      status: 'PENDENTE',
-    },
-  })
-
-  scheduleTimer(agendamento.id, agendamento.agendadoPara)
-
-  logger.info(`Mensagem agendada: ${agendamento.id} para ${agendadoPara}`)
-  return agendamento
-}
-
-/**
- * Cancela agendamento e remove timer da memória.
- */
-async function cancelSchedule(agendamentoId) {
-  if (timers.has(agendamentoId)) {
-    clearTimeout(timers.get(agendamentoId))
-    timers.delete(agendamentoId)
-  }
-
-  await prisma.agendamento.update({
-    where: { id: agendamentoId },
-    data: { status: 'CANCELADO' },
-  })
-
-  logger.info(`Agendamento ${agendamentoId} cancelado`)
-}
-
-/**
- * Ao iniciar o servidor, recarrega agendamentos PENDENTE do banco para a memória.
- * Necessário porque os timers não persistem entre reinicializações.
- */
-async function restoreSchedules() {
+router.post('/:id/send', async (req, res) => {
   try {
-    const pendentes = await prisma.agendamento.findMany({
-      where: { status: 'PENDENTE' },
-    })
+    const { message } = req.body
+    const sessao = await prisma.sessao.findFirst({ where: { id: req.params.id, tenantId: req.tenantId }, include: { eleitor: true, tenant: true } })
+    if (!sessao) return res.status(404).json({ error: 'Sessão não encontrada' })
+    const { encrypt } = require('../utils/crypto')
+    let msgs = []
+    try { msgs = JSON.parse(decrypt(sessao.mensagensEnc) || '[]') } catch {}
+    msgs.push({ role: 'human_agent', content: message, timestamp: new Date().toISOString(), operatorId: req.user.id })
+    await prisma.sessao.update({ where: { id: sessao.id }, data: { mensagensEnc: encrypt(JSON.stringify(msgs)) } })
+    const { sendText } = require('../services/whatsappService')
+    const { decrypt: dec } = require('../utils/crypto')
+    const numero = dec(sessao.eleitor.whatsappNumberEnc)
+    await sendText(sessao.tenant, numero, message)
+    res.json({ ok: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
 
-    for (const ag of pendentes) {
-      scheduleTimer(ag.id, ag.agendadoPara)
-    }
+router.patch('/:id/return-to-ai', async (req, res) => {
+  try {
+    await prisma.sessao.updateMany({ where: { id: req.params.id, tenantId: req.tenantId }, data: { escalonadoParaHumano: false, operadorId: null } })
+    res.json({ ok: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
 
-    logger.info(`${pendentes.length} agendamento(s) restaurado(s) da base de dados`)
-  } catch (err) {
-    logger.error('Erro ao restaurar agendamentos:', err.message)
-  }
-}
+router.patch('/:id/close', async (req, res) => {
+  try {
+    await prisma.sessao.updateMany({ where: { id: req.params.id, tenantId: req.tenantId }, data: { ativa: false, encerradoAt: new Date() } })
+    res.json({ ok: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
 
-/**
- * Reset diário dos contadores de mensagens (cron às 00:00).
- */
-async function resetDailyCounters() {
-  await prisma.tenant.updateMany({
-    where: {},
-    data: { mensagensHoje: 0, dataResetContador: new Date() },
-  })
-  logger.info('Contadores diários resetados')
-}
-
-/**
- * Monitora Quality Score de todos os tenants ativos (cron 09:00 e 15:00).
- */
-async function monitorQualityScores() {
-  const { getQualityScore } = require('./whatsappService')
-  const tenants = await prisma.tenant.findMany({ where: { ativo: true } })
-
-  for (const tenant of tenants) {
-    try {
-      const { qualityRating } = await getQualityScore(tenant)
-      const scoreMap = { GREEN: 'VERDE', YELLOW: 'AMARELO', RED: 'VERMELHO' }
-      const novoScore = scoreMap[qualityRating] || tenant.qualityScore
-
-      const updateData = { qualityScore: novoScore }
-      if (novoScore === 'VERMELHO') updateData.disparosPausados = true
-      if (novoScore === 'VERDE') updateData.disparosPausados = false
-
-      await prisma.tenant.update({ where: { id: tenant.id }, data: updateData })
-
-      if (novoScore !== tenant.qualityScore) {
-        logger.warn(`Quality Score tenant ${tenant.id}: ${tenant.qualityScore} → ${novoScore}`)
-      }
-    } catch (err) {
-      logger.error(`Erro ao monitorar QS do tenant ${tenant.id}:`, err.message)
-    }
-  }
-}
-
-module.exports = {
-  scheduleMessage,
-  cancelSchedule,
-  restoreSchedules,
-  resetDailyCounters,
-  monitorQualityScores,
-}
+module.exports = router

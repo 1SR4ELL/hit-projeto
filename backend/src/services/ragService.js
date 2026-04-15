@@ -1,247 +1,76 @@
-/**
- * schedulerService.js — In-memory scheduler (sem Bull/Redis)
- * Compatível com SQLite para desenvolvimento local.
- * Em produção, substituir por Bull + Redis (ver schedulerService.prod.js).
- */
-const config = require('../config')
+const { generateEmbedding } = require('./openaiService')
 const logger = require('../utils/logger')
-const whatsappService = require('./whatsappService')
-const { decrypt } = require('../utils/crypto')
-
 const prisma = require('../utils/prismaClient')
 
-// ─── MAPA DE TIMERS (job em memória) ─────────────────────────────────────────
-// agendamentoId → NodeJS.Timeout
-const timers = new Map()
+const CHUNK_SIZE = 800
+const CHUNK_OVERLAP = 100
+const TOP_K = 5
+const MIN_SIMILARITY = 0.30
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function buildTemplateComponents(variaveis) {
-  if (!variaveis) return []
-  const components = []
-  if (variaveis.header) {
-    components.push({ type: 'header', parameters: [{ type: 'text', text: variaveis.header }] })
+function chunkText(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
+  const chunks = []
+  let start = 0
+  while (start < text.length) {
+    const end = Math.min(start + size, text.length)
+    const chunk = text.slice(start, end).trim()
+    if (chunk.length > 50) chunks.push(chunk)
+    start += size - overlap
   }
-  if (variaveis.body && Array.isArray(variaveis.body)) {
-    components.push({
-      type: 'body',
-      parameters: variaveis.body.map(v => ({ type: 'text', text: String(v) })),
-    })
-  }
-  return components
+  return chunks
 }
 
-// ─── EXECUTOR DO JOB ─────────────────────────────────────────────────────────
-async function executeJob(agendamentoId) {
-  timers.delete(agendamentoId)
-
-  let agendamento
-  try {
-    agendamento = await prisma.agendamento.findUnique({
-      where: { id: agendamentoId },
-      include: { tenant: true, eleitor: true },
-    })
-  } catch (err) {
-    logger.error(`Erro ao buscar agendamento ${agendamentoId}:`, err.message)
-    return
+function cosineSimilarity(a, b) {
+  let dot = 0, normA = 0, normB = 0
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i]; normA += a[i]*a[i]; normB += b[i]*b[i]
   }
-
-  if (!agendamento || agendamento.status !== 'PENDENTE') {
-    logger.info(`Agendamento ${agendamentoId} ignorado (status: ${agendamento?.status ?? 'não encontrado'})`)
-    return
-  }
-
-  // Verificar opt-in do eleitor
-  if (agendamento.eleitor && agendamento.eleitor.optInStatus !== 'ACEITO') {
-    await prisma.agendamento.update({
-      where: { id: agendamentoId },
-      data: { status: 'CANCELADO', erroMensagem: 'Eleitor sem opt-in ativo' },
-    })
-    logger.warn(`Agendamento ${agendamentoId} cancelado: eleitor sem opt-in`)
-    return
-  }
-
-  // Verificar anti-ban
-  const safeCheck = whatsappService.isSafeToSend(agendamento.tenant)
-  if (!safeCheck.safe) {
-    logger.warn(`Envio bloqueado para ${agendamentoId}: ${safeCheck.reason}`)
-    // Re-agenda para 1h depois
-    const novaData = new Date(Date.now() + 3_600_000)
-    await prisma.agendamento.update({
-      where: { id: agendamentoId },
-      data: { agendadoPara: novaData, erroMensagem: `Adiado: ${safeCheck.reason}` },
-    })
-    scheduleTimer(agendamentoId, novaData)
-    return
-  }
-
-  let tentativas = agendamento.tentativas
-  const MAX_TENTATIVAS = 3
-
-  try {
-    const numero = decrypt(agendamento.eleitor.whatsappNumberEnc)
-    const variaveis = agendamento.variaveis ? JSON.parse(agendamento.variaveis) : {}
-    const components = buildTemplateComponents(variaveis)
-
-    await whatsappService.sendTemplate(
-      agendamento.tenant,
-      numero,
-      agendamento.templateNome,
-      'pt_BR',
-      components
-    )
-
-    await prisma.agendamento.update({
-      where: { id: agendamentoId },
-      data: { status: 'ENVIADO', enviadoAt: new Date() },
-    })
-
-    await prisma.tenant.update({
-      where: { id: agendamento.tenantId },
-      data: { mensagensHoje: { increment: 1 } },
-    })
-
-    logger.info(`Agendamento ${agendamentoId} enviado com sucesso`)
-  } catch (err) {
-    tentativas += 1
-    logger.error(`Erro ao executar agendamento ${agendamentoId} (tentativa ${tentativas}):`, err.message)
-
-    if (tentativas < MAX_TENTATIVAS) {
-      const retryDelay = Math.pow(2, tentativas) * 60_000 // 2min, 4min
-      const retryAt = new Date(Date.now() + retryDelay)
-      await prisma.agendamento.update({
-        where: { id: agendamentoId },
-        data: { tentativas, erroMensagem: err.message, agendadoPara: retryAt },
-      })
-      scheduleTimer(agendamentoId, retryAt)
-      logger.info(`Agendamento ${agendamentoId} reagendado para retry em ${retryDelay / 1000}s`)
-    } else {
-      await prisma.agendamento.update({
-        where: { id: agendamentoId },
-        data: { status: 'ERRO', tentativas, erroMensagem: err.message },
-      })
-    }
-  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB)
+  return denom === 0 ? 0 : dot / denom
 }
 
-// ─── TIMER HELPER ─────────────────────────────────────────────────────────────
-function scheduleTimer(agendamentoId, dataAgendada) {
-  const delay = Math.max(new Date(dataAgendada).getTime() - Date.now(), 0)
-
-  // Limpar timer existente se houver
-  if (timers.has(agendamentoId)) {
-    clearTimeout(timers.get(agendamentoId))
-  }
-
-  const timer = setTimeout(() => executeJob(agendamentoId), delay)
-  // Impede que o timer bloqueie o processo de fechar
-  if (timer.unref) timer.unref()
-  timers.set(agendamentoId, timer)
-}
-
-// ─── API PÚBLICA ──────────────────────────────────────────────────────────────
-
-/**
- * Agenda envio de template HSM para um eleitor.
- */
-async function scheduleMessage({ tenantId, eleitorId, tipo, templateNome, variaveis, agendadoPara }) {
-  const agendamento = await prisma.agendamento.create({
-    data: {
-      tenantId,
-      eleitorId,
-      tipo,
-      templateNome,
-      variaveis: variaveis ? JSON.stringify(variaveis) : null,
-      agendadoPara: new Date(agendadoPara),
-      status: 'PENDENTE',
-    },
-  })
-
-  scheduleTimer(agendamento.id, agendamento.agendadoPara)
-
-  logger.info(`Mensagem agendada: ${agendamento.id} para ${agendadoPara}`)
-  return agendamento
-}
-
-/**
- * Cancela agendamento e remove timer da memória.
- */
-async function cancelSchedule(agendamentoId) {
-  if (timers.has(agendamentoId)) {
-    clearTimeout(timers.get(agendamentoId))
-    timers.delete(agendamentoId)
-  }
-
-  await prisma.agendamento.update({
-    where: { id: agendamentoId },
-    data: { status: 'CANCELADO' },
-  })
-
-  logger.info(`Agendamento ${agendamentoId} cancelado`)
-}
-
-/**
- * Ao iniciar o servidor, recarrega agendamentos PENDENTE do banco para a memória.
- * Necessário porque os timers não persistem entre reinicializações.
- */
-async function restoreSchedules() {
-  try {
-    const pendentes = await prisma.agendamento.findMany({
-      where: { status: 'PENDENTE' },
-    })
-
-    for (const ag of pendentes) {
-      scheduleTimer(ag.id, ag.agendadoPara)
-    }
-
-    logger.info(`${pendentes.length} agendamento(s) restaurado(s) da base de dados`)
-  } catch (err) {
-    logger.error('Erro ao restaurar agendamentos:', err.message)
-  }
-}
-
-/**
- * Reset diário dos contadores de mensagens (cron às 00:00).
- */
-async function resetDailyCounters() {
-  await prisma.tenant.updateMany({
-    where: {},
-    data: { mensagensHoje: 0, dataResetContador: new Date() },
-  })
-  logger.info('Contadores diários resetados')
-}
-
-/**
- * Monitora Quality Score de todos os tenants ativos (cron 09:00 e 15:00).
- */
-async function monitorQualityScores() {
-  const { getQualityScore } = require('./whatsappService')
-  const tenants = await prisma.tenant.findMany({ where: { ativo: true } })
-
-  for (const tenant of tenants) {
+async function indexDocument(documentoId, conteudo, tenantId, tenant) {
+  const chunks = chunkText(conteudo)
+  logger.info(`Indexando documento ${documentoId}: ${chunks.length} chunks`)
+  await prisma.documentoChunk.deleteMany({ where: { documentoId } })
+  let indexed = 0
+  for (let i = 0; i < chunks.length; i++) {
     try {
-      const { qualityRating } = await getQualityScore(tenant)
-      const scoreMap = { GREEN: 'VERDE', YELLOW: 'AMARELO', RED: 'VERMELHO' }
-      const novoScore = scoreMap[qualityRating] || tenant.qualityScore
-
-      const updateData = { qualityScore: novoScore }
-      if (novoScore === 'VERMELHO') updateData.disparosPausados = true
-      if (novoScore === 'VERDE') updateData.disparosPausados = false
-
-      await prisma.tenant.update({ where: { id: tenant.id }, data: updateData })
-
-      if (novoScore !== tenant.qualityScore) {
-        logger.warn(`Quality Score tenant ${tenant.id}: ${tenant.qualityScore} → ${novoScore}`)
+      let embeddingStr = null
+      try {
+        const vec = await generateEmbedding(chunks[i], tenant)
+        embeddingStr = JSON.stringify(vec)
+      } catch (e) {
+        logger.warn(`Embedding indisponivel para chunk ${i}`)
       }
-    } catch (err) {
-      logger.error(`Erro ao monitorar QS do tenant ${tenant.id}:`, err.message)
-    }
+      await prisma.documentoChunk.create({
+        data: { documentoId, tenantId, conteudo: chunks[i], embedding: embeddingStr, chunkIndex: i },
+      })
+      indexed++
+    } catch (err) { logger.error(`Erro chunk ${i}:`, err.message) }
   }
+  await prisma.documento.update({ where: { id: documentoId }, data: { processado: true, totalChunks: indexed } })
+  return { indexed, total: chunks.length }
 }
 
-module.exports = {
-  scheduleMessage,
-  cancelSchedule,
-  restoreSchedules,
-  resetDailyCounters,
-  monitorQualityScores,
+async function search(query, tenantId, tenant) {
+  try {
+    const chunks = await prisma.documentoChunk.findMany({ where: { tenantId }, select: { conteudo: true, embedding: true } })
+    if (chunks.length === 0) return ''
+    const withEmbedding = chunks.filter(c => c.embedding)
+    let results = []
+    if (withEmbedding.length > 0) {
+      try {
+        const queryVec = await generateEmbedding(query, tenant)
+        const scored = withEmbedding.map(c => ({ conteudo: c.conteudo, similarity: cosineSimilarity(queryVec, JSON.parse(c.embedding)) }))
+        results = scored.filter(r => r.similarity >= MIN_SIMILARITY).sort((a,b) => b.similarity-a.similarity).slice(0,TOP_K)
+      } catch {}
+    }
+    if (results.length === 0) {
+      const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 3)
+      results = chunks.map(c => ({ conteudo: c.conteudo, similarity: words.reduce((acc,w) => acc+(c.conteudo.toLowerCase().includes(w)?1:0),0)/(words.length||1) })).filter(r=>r.similarity>0).sort((a,b)=>b.similarity-a.similarity).slice(0,TOP_K)
+    }
+    return results.map(r => r.conteudo).join('\n\n---\n\n')
+  } catch (err) { logger.error('Erro RAG:', err.message); return '' }
 }
+
+module.exports = { indexDocument, search, chunkText }
