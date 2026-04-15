@@ -1,0 +1,196 @@
+// HIT Politic-AI — Prisma Schema
+// PostgreSQL para produção (Railway). RAG usa cosine similarity em JS (sem pgvector).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── TENANT (Campanha) ────────────────────────────────────────────────────────
+model Tenant {
+  id                    String   @id @default(uuid())
+  nomeCandidato         String
+  cargoPretenido        String
+  municipioUf           String
+  partido               String?
+  whatsappNumberId      String   @unique
+  whatsappPhoneNumber   String
+  whatsappBackupNumberId String?
+  metaAccessTokenEnc    String
+  openaiApiKeyEnc       String?
+
+  nomeAssistente        String   @default("Assistente")
+  tomVoz                String   @default("acessivel")
+  formalidade           String   @default("semiformal")
+  bioAssistente         String?
+  saudacaoPersonalizada String?
+  palavrasChaveEscalonamento String @default("imprensa,juridico,denuncia,urgente")
+
+  qualityScore          String   @default("VERDE")
+  tierEnvio             Int      @default(1)
+  mensagensHoje         Int      @default(0)
+  dataResetContador     DateTime @default(now())
+  disparosPausados      Boolean  @default(false)
+
+  ativo                 Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  usuarios              Usuario[]
+  eleitores             Eleitor[]
+  sessoes               Sessao[]
+  documentos            Documento[]
+  templates             TemplateMeta[]
+  agendamentos          Agendamento[]
+
+  @@map("tenants")
+}
+
+// ─── USUÁRIO DO DASHBOARD ─────────────────────────────────────────────────────
+model Usuario {
+  id           String   @id @default(uuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  nome         String
+  email        String   @unique
+  senhaHash    String
+  role         String   @default("OPERADOR")
+  ativo        Boolean  @default(true)
+  ultimoLogin  DateTime?
+  createdAt    DateTime @default(now())
+
+  @@map("usuarios")
+}
+
+// ─── ELEITOR ──────────────────────────────────────────────────────────────────
+model Eleitor {
+  id                  String   @id @default(uuid())
+  tenantId            String
+  tenant              Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  whatsappIdHash      String
+  whatsappNumberEnc   String
+  nomePreferido       String?
+  municipio           String?
+  bairro              String?
+  interessePrincipal  String?
+  zonaEleitoral       String?
+  secaoEleitoral      String?
+  optInStatus         String   @default("PENDENTE")
+  optInTimestamp      DateTime?
+  optInIpHash         String?
+  reminderAgendado    Boolean  @default(false)
+  totalInteracoes     Int      @default(0)
+  ultimaInteracao     DateTime?
+  createdAt           DateTime @default(now())
+
+  sessoes             Sessao[]
+  agendamentos        Agendamento[]
+
+  @@unique([tenantId, whatsappIdHash])
+  @@map("eleitores")
+}
+
+// ─── SESSÃO DE CONVERSA ───────────────────────────────────────────────────────
+model Sessao {
+  id                   String   @id @default(uuid())
+  tenantId             String
+  tenant               Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  eleitorId            String
+  eleitor              Eleitor  @relation(fields: [eleitorId], references: [id], onDelete: Cascade)
+  mensagensEnc         String
+  intentDetectada      String?
+  escalonadoParaHumano Boolean  @default(false)
+  operadorId           String?
+  satisfacaoEleitor    Int?
+  totalTokens          Int      @default(0)
+  ativa                Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  encerradoAt          DateTime?
+
+  @@map("sessoes")
+}
+
+// ─── DOCUMENTO (Base de Conhecimento) ────────────────────────────────────────
+model Documento {
+  id          String   @id @default(uuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  titulo      String
+  tipo        String
+  conteudo    String
+  arquivoPath String?
+  tamanhoBytes Int?
+  mimeType    String?
+  processado  Boolean  @default(false)
+  totalChunks Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  chunks      DocumentoChunk[]
+
+  @@map("documentos")
+}
+
+// ─── CHUNK (embedding como JSON string) ──────────────────────────────────────
+model DocumentoChunk {
+  id           String   @id @default(uuid())
+  documentoId  String
+  documento    Documento @relation(fields: [documentoId], references: [id], onDelete: Cascade)
+  tenantId     String
+  conteudo     String
+  embedding    String?   // JSON array serializado
+  chunkIndex   Int
+  createdAt    DateTime @default(now())
+
+  @@map("documento_chunks")
+}
+
+// ─── TEMPLATE HSM ─────────────────────────────────────────────────────────────
+model TemplateMeta {
+  id              String   @id @default(uuid())
+  tenantId        String
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  nome            String
+  categoria       String
+  idioma          String   @default("pt_BR")
+  status          String   @default("PENDENTE")
+  headerTipo      String?
+  headerConteudo  String?
+  corpo           String
+  rodape          String?
+  botoes          String?  // JSON serializado
+  metaTemplateId  String?
+  motivoRejeicao  String?
+  ativo           Boolean  @default(true)
+  totalEnvios     Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([tenantId, nome])
+  @@map("templates_meta")
+}
+
+// ─── AGENDAMENTO ──────────────────────────────────────────────────────────────
+model Agendamento {
+  id              String   @id @default(uuid())
+  tenantId        String
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  eleitorId       String?
+  eleitor         Eleitor? @relation(fields: [eleitorId], references: [id], onDelete: SetNull)
+  tipo            String
+  templateNome    String
+  variaveis       String?  // JSON serializado
+  agendadoPara    DateTime
+  enviadoAt       DateTime?
+  status          String   @default("PENDENTE")
+  tentativas      Int      @default(0)
+  erroMensagem    String?
+  bullJobId       String?
+  createdAt       DateTime @default(now())
+
+  @@map("agendamentos")
+}
