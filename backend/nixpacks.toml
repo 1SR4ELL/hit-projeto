@@ -1,8 +1,11 @@
+[phases.setup]
+nixPkgs = ["openssl", "openssl.dev"]
+
 [phases.install]
 cmds = ["npm install"]
 
 [phases.build]
-cmds = ["npx prisma generate"]
+cmds = ["DATABASE_URL=postgresql://x:x@localhost:5432/x npx prisma generate"]
 
 [start]
 cmd = "npm start"
