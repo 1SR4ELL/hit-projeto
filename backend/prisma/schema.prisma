@@ -2,8 +2,8 @@
 // PostgreSQL para produção (Railway). RAG usa cosine similarity em JS (sem pgvector).
 
 generator client {
-  provider      = "prisma-client-js"
-  binaryTargets = ["native", "debian-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
