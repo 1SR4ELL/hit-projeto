@@ -10,7 +10,6 @@
     "dev": "nodemon src/index.js",
     "build": "prisma generate",
     "start": "prisma migrate deploy && node src/utils/seed.js && node src/index.js",
-    "postinstall": "prisma generate",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:seed": "node src/utils/seed.js",
