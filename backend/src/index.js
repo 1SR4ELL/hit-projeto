@@ -20,7 +20,8 @@ const knowledgeRoutes = require('./routes/knowledge');
 const templatesRoutes = require('./routes/templates');
 const schedulerRoutes = require('./routes/scheduler');
 const votersRoutes = require('./routes/voters');
-const settingsRoutes = require('./routes/settings');
+const settingsRoutes = require('./routes/settings')
+const adminSeedRoutes = require('./routes/adminSeed');
 
 // ─── APP ──────────────────────────────────────────────────────────────────────
 const app = express();
@@ -104,7 +105,8 @@ app.use('/api/knowledge', knowledgeRoutes);
 app.use('/api/templates', templatesRoutes);
 app.use('/api/scheduler', schedulerRoutes);
 app.use('/api/voters', votersRoutes);
-app.use('/api/settings', settingsRoutes);
+app.use('/api/settings', settingsRoutes)
+app.use('/api/admin/seed', adminSeedRoutes);
 
 // ─── ERROR HANDLER ────────────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
